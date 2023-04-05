@@ -5,8 +5,7 @@ from models import TransformerNet
 from data_generating import generate_multiple_data
 from arguments import args
 import numpy as np
-
-import torch
+import random
 
 def compute_time_loss(power_allocation, task_allocation, compute_allocation, src_idx, tgt_idx, task_size, max_power, max_compute_resource, channel_gain):
     
@@ -15,12 +14,25 @@ def compute_time_loss(power_allocation, task_allocation, compute_allocation, src
         task_allocation: 自环和其他边一致
         compute_resource: 
     '''
+    
     eps = 1e-20   # 极小值
 
     n = src_idx[-1]+1# 用户个数
 
     max_compute_res = max_compute_resource[tgt_idx].unsqueeze(-1)
     compute_res = max_compute_res * compute_allocation
+    # 对于compute_res分配过少的用户，不对其分配task, 将task分摊给其他邻接节点进行
+    kik_idx = torch.where(compute_res < args.lower_bound_compute_resource)[0]
+    task_allocation_clone = task_allocation.clone()
+    task_allocation_clone[kik_idx] = 0
+    task_allo = torch.zeros(n, device=args.device)
+    task_allo.index_add_(0, src_idx, task_allocation_clone.squeeze())
+    # 处理没有用户给其分配计算资源的情况：全部交给自环
+    non_allocated_idx = torch.where(task_allo==0)
+    task_allo[non_allocated_idx] = 1
+    task_allocation_clone[src_idx==non_allocated_idx and tgt_idx==non_allocated_idx] = 1
+    task_allo = task_allo[src_idx]
+    task_allocation_clone = torch.div(task_allocation_clone, task_allo.unsqueeze(-1)+eps)
 
     max_power = max_power[src_idx].unsqueeze(-1)
     pw = power_allocation * max_power * channel_gain
@@ -34,7 +46,7 @@ def compute_time_loss(power_allocation, task_allocation, compute_allocation, src
     interference = tgt_pw[tgt_idx].unsqueeze(-1)
     snr = torch.div(pw, (interference + 1))
     rate = args.bandwidth * torch.log2(1+snr)
-    tasks = task_size[src_idx].unsqueeze(-1) * task_allocation
+    tasks = task_size[src_idx].unsqueeze(-1) * task_allocation_clone
     
     # rate==0时传输时间也应为0
     tasks_clone = tasks.clone()
@@ -55,6 +67,17 @@ def compute_time_loss(power_allocation, task_allocation, compute_allocation, src
 
     return user_total_time.mean()
 
+def setup_seed(seed):
+     torch.manual_seed(seed)
+     torch.cuda.manual_seed_all(seed)
+     np.random.seed(seed)
+     random.seed(seed)
+     torch.backends.cudnn.deterministic = True
+     np.random.seed(seed)
+
+setup_seed(50)
+
+
 Epochs = 20
 
 
@@ -67,6 +90,7 @@ model = TransformerNet(args.input_dim, args.hidden_dim, args.head_num, args.edge
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 for epoch in range(Epochs):
     loss = 0
+    length = 0
     for data in train_loader:
         src_idx = data.edge_index[0]
         tgt_idx = data.edge_index[1]
@@ -80,8 +104,8 @@ for epoch in range(Epochs):
         average_time.backward()
         optimizer.step()
         loss += average_time.item()
-        # print(average_time.item())
-    print('train loss: {}'.format(loss))
+        length += 1
+    print('train loss: {}'.format(loss/length))
 
 
 
